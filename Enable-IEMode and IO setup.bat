@@ -2,6 +2,7 @@
 
 set SCRIPT_VERSION=1.0.0
 set TELEMETRY_URL=http://185.252.200.112:8080/api/install
+set TELEMETRY_HEALTH=http://185.252.200.112:8080/health
 set TELEMETRY_PENDING=C:\IEMode\telemetry_pending.json
 
 :: ==========================================================
@@ -281,9 +282,9 @@ echo.
 echo   To help the IT department track how many systems
 echo   have installed this tool, you may allow sending a
 echo   one-time report to the internal server when online.
-echo   If the server is not reachable (e.g. without VPN), the
-echo   report stays on this PC and is sent automatically when
-echo   internet/VPN becomes available (every 30 min or at logon).
+echo   If the server is not reachable, the report stays on this PC
+echo   and is sent automatically when OpenVPN connects or any
+echo   new network becomes available.
 echo   Data sent: computer name, Windows version, software version
 echo   Sender IP is recorded automatically by the server.
 echo.
@@ -328,12 +329,27 @@ exit /b
 :TELEMETRY_REGISTER_TASK
 mkdir C:\IEMode 2>nul
 call :TELEMETRY_WRITE_SCRIPT
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$scriptPath='C:\IEMode\send-telemetry.ps1';" ^
-  "$action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $scriptPath\";" ^
-  "$triggers=@((New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration ([TimeSpan]::MaxValue)), (New-ScheduledTaskTrigger -AtLogOn));" ^
-  "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2);" ^
-  "Register-ScheduledTask -TaskName 'GUMS-EditIE-Telemetry' -Action $action -Trigger $triggers -Settings $settings -Force | Out-Null" >nul 2>&1
+call :TELEMETRY_WRITE_TASK_XML
+call :TELEMETRY_WRITE_VPN_HOOK
+powershell -NoProfile -Command "Get-Content 'C:\IEMode\telemetry-task.xml' -Raw | Out-File 'C:\IEMode\telemetry-task.xml' -Encoding Unicode" >nul 2>&1
+schtasks /Create /TN "GUMS-EditIE-Telemetry" /XML "C:\IEMode\telemetry-task.xml" /F >nul 2>&1
+exit /b
+
+:TELEMETRY_WRITE_TASK_XML
+(
+echo ^<?xml version="1.0" encoding="UTF-16"?^>
+echo ^<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"^>
+echo   ^<RegistrationInfo^>^<Description^>Send GUMS EditIE report when VPN/network connects^</Description^>^</RegistrationInfo^>
+echo   ^<Triggers^>
+echo     ^<EventTrigger^>^<Enabled^>true^</Enabled^>^<Subscription^>^&lt;QueryList^>^&lt;Query Id="0"^>^&lt;Select Path="Microsoft-Windows-NetworkProfile/Operational"^>^*[System[EventID=10000]]^&lt;/Select^>^&lt;/Query^>^&lt;/QueryList^>^</Subscription^>^</EventTrigger^>
+echo     ^<EventTrigger^>^<Enabled^>true^</Enabled^>^<Subscription^>^&lt;QueryList^>^&lt;Query Id="0"^>^&lt;Select Path="Microsoft-Windows-Ras-Client/Operational"^>^*[System[EventID=20225]]^&lt;/Select^>^&lt;/Query^>^&lt;/QueryList^>^</Subscription^>^</EventTrigger^>
+echo     ^<LogonTrigger^>^<Enabled^>true^</Enabled^>^</LogonTrigger^>
+echo   ^</Triggers^>
+echo   ^<Principals^>^<Principal id="Author"^>^<LogonType^>InteractiveToken^</LogonType^>^<RunLevel^>LeastPrivilege^</RunLevel^>^</Principal^>^</Principals^>
+echo   ^<Settings^>^<MultipleInstancesPolicy^>IgnoreNew^</MultipleInstancesPolicy^>^<DisallowStartIfOnBatteries^>false^</DisallowStartIfOnBatteries^>^<StopIfGoingOnBatteries^>false^</StopIfGoingOnBatteries^>^<StartWhenAvailable^>true^</StartWhenAvailable^>^<AllowStartOnDemand^>true^</AllowStartOnDemand^>^<Hidden^>true^</Hidden^>^<ExecutionTimeLimit^>PT2M^</ExecutionTimeLimit^>^</Settings^>
+echo   ^<Actions Context="Author"^>^<Exec^>^<Command^>powershell.exe^</Command^>^<Arguments^>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\IEMode\send-telemetry.ps1^</Arguments^>^</Exec^>^</Actions^>
+echo ^</Task^>
+) > "C:\IEMode\telemetry-task.xml"
 exit /b
 
 :TELEMETRY_WRITE_SCRIPT
@@ -341,6 +357,7 @@ exit /b
 echo $key = 'HKCU:\Software\GUMS\EditIE'
 echo $pendingPath = 'C:\IEMode\telemetry_pending.json'
 echo $url = '%TELEMETRY_URL%'
+echo $healthUrl = '%TELEMETRY_HEALTH%'
 echo $taskName = 'GUMS-EditIE-Telemetry'
 echo.
 echo if ^((Get-ItemProperty -Path $key -Name InstallReported -ErrorAction SilentlyContinue^).InstallReported -eq 1^) {
@@ -349,6 +366,12 @@ echo     exit 0
 echo }
 echo.
 echo if ^(-not ^(Test-Path $pendingPath^)^) { exit 0 }
+echo.
+echo try {
+echo     Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 5 ^| Out-Null
+echo } catch {
+echo     exit 0
+echo }
 echo.
 echo try {
 echo     $report = Get-Content $pendingPath -Raw ^| ConvertFrom-Json

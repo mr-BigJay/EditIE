@@ -7,7 +7,22 @@ Windows batch utility for configuring Microsoft Edge IE Mode and Internet Option
 On first run, users are asked whether they agree to send a **one-time report** to the IT server when the system is online.
 
 - **Default:** No data is sent unless the user explicitly chooses "Yes".
-- **Offline / VPN support:** Report is saved locally at `C:\IEMode\telemetry_pending.json`. A background Windows scheduled task retries every **30 minutes** and at **user logon** — so when OpenVPN connects and the server becomes reachable, it sends automatically without re-running the batch file.
+- **Offline / VPN support:** Report is saved locally at `C:\IEMode\telemetry_pending.json`. A Windows scheduled task runs when:
+  - **A new network connects** (including OpenVPN TAP adapter)
+  - **Windows VPN (RAS) connects**
+  - **User logs on** (if VPN auto-connects at login)
+- Before sending, the script checks that `http://185.252.200.112:8080/health` is reachable — so it only sends when the server is actually available through VPN.
+
+### Optional: instant send on OpenVPN connect
+
+If you manage OpenVPN configs centrally, add these lines to each `.ovpn` file:
+
+```
+script-security 2
+up "C:\\IEMode\\vpn-send.cmd"
+```
+
+The batch file creates `C:\IEMode\vpn-send.cmd` automatically when the user opts in. This sends the report immediately when OpenVPN connects (in addition to the Windows network event trigger).
 - **Data collected:** Computer name, Windows version, script version. Server also records sender IP.
 
 ---

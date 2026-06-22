@@ -1,5 +1,9 @@
 @echo off
 
+set SCRIPT_VERSION=1.0.0
+:: Replace with your internal server endpoint before distribution
+set TELEMETRY_URL=https://YOUR-SERVER.example.com/api/install
+
 :: ==========================================================
 :: Run as Administrator
 :: ==========================================================
@@ -12,6 +16,8 @@ IF %ERRORLEVEL% NEQ 0 (
 
 title Automation Office Configuration - GUMS
 color 0A
+
+call :TELEMETRY_INIT
 
 :MENU
 cls
@@ -256,3 +262,58 @@ echo Factory settings restored successfully.
 echo.
 pause
 goto MENU
+
+:: ==========================================================
+:: OPT-IN INSTALLATION TELEMETRY
+:: ==========================================================
+
+:TELEMETRY_INIT
+reg query "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn >nul 2>&1
+if %ERRORLEVEL% NEQ 0 goto ASK_TELEMETRY
+goto TELEMETRY_MAYBE_SEND
+
+:ASK_TELEMETRY
+cls
+echo ==========================================================
+echo.
+echo   Organizational Install Statistics (Optional)
+echo.
+echo   To help the IT department track how many systems
+echo   have installed this tool, you may allow sending a
+echo   one-time anonymous report to the internal server.
+echo.
+echo   Data sent: random ID, software version, Windows version
+echo   No personal information is collected.
+echo.
+echo   [1] Yes, I agree
+echo   [2] No, do not send
+echo.
+echo ==========================================================
+echo.
+set /p telemetry_choice=Select an option: 
+
+if "%telemetry_choice%"=="1" (
+    for /f %%i in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString()"') do set INSTALL_ID=%%i
+    reg add "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn /t REG_DWORD /d 1 /f >nul
+    reg add "HKCU\Software\GUMS\EditIE" /v InstallId /t REG_SZ /d "%INSTALL_ID%" /f >nul
+) else (
+    reg add "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn /t REG_DWORD /d 0 /f >nul
+)
+
+:TELEMETRY_MAYBE_SEND
+reg query "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn | find "0x1" >nul
+if %ERRORLEVEL% NEQ 0 exit /b
+
+reg query "HKCU\Software\GUMS\EditIE" /v InstallReported >nul 2>&1
+if %ERRORLEVEL% EQU 0 exit /b
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='SilentlyContinue';" ^
+  "$key='HKCU:\Software\GUMS\EditIE';" ^
+  "$id=(Get-ItemProperty -Path $key -Name InstallId).InstallId;" ^
+  "$os=(Get-CimInstance Win32_OperatingSystem).Caption;" ^
+  "$body=@{installId=$id;version='%SCRIPT_VERSION%';os=$os}|ConvertTo-Json;" ^
+  "Invoke-RestMethod -Uri '%TELEMETRY_URL%' -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 5;" ^
+  "Set-ItemProperty -Path $key -Name InstallReported -Value 1 -Type DWord" >nul 2>&1
+
+exit /b

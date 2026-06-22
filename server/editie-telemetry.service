@@ -1,0 +1,17 @@
+[Unit]
+Description=EditIE Install Telemetry API
+After=network.target
+
+[Service]
+Type=simple
+User=editie
+Group=editie
+WorkingDirectory=/opt/editie-telemetry
+Environment=EDITIE_LOG_DIR=/var/log/editie
+Environment=EDITIE_PORT=8080
+ExecStart=/opt/editie-telemetry/venv/bin/gunicorn --bind 0.0.0.0:8080 --workers 2 --timeout 30 app:APP
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

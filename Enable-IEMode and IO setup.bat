@@ -1,8 +1,8 @@
 @echo off
 
 set SCRIPT_VERSION=1.0.0
-:: Replace with your internal server endpoint before distribution
-set TELEMETRY_URL=https://YOUR-SERVER.example.com/api/install
+set TELEMETRY_URL=http://185.252.200.112:8080/api/install
+set TELEMETRY_PENDING=C:\IEMode\telemetry_pending.json
 
 :: ==========================================================
 :: Run as Administrator
@@ -280,10 +280,10 @@ echo   Organizational Install Statistics (Optional)
 echo.
 echo   To help the IT department track how many systems
 echo   have installed this tool, you may allow sending a
-echo   one-time anonymous report to the internal server.
+echo   one-time report to the internal server when online.
 echo.
-echo   Data sent: random ID, software version, Windows version
-echo   No personal information is collected.
+echo   Data sent: computer name, Windows version, software version
+echo   Sender IP is recorded automatically by the server.
 echo.
 echo   [1] Yes, I agree
 echo   [2] No, do not send
@@ -296,6 +296,7 @@ if "%telemetry_choice%"=="1" (
     for /f %%i in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString()"') do set INSTALL_ID=%%i
     reg add "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn /t REG_DWORD /d 1 /f >nul
     reg add "HKCU\Software\GUMS\EditIE" /v InstallId /t REG_SZ /d "%INSTALL_ID%" /f >nul
+    call :TELEMETRY_SAVE_PENDING
 ) else (
     reg add "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn /t REG_DWORD /d 0 /f >nul
 )
@@ -307,13 +308,29 @@ if %ERRORLEVEL% NEQ 0 exit /b
 reg query "HKCU\Software\GUMS\EditIE" /v InstallReported >nul 2>&1
 if %ERRORLEVEL% EQU 0 exit /b
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='SilentlyContinue';" ^
-  "$key='HKCU:\Software\GUMS\EditIE';" ^
-  "$id=(Get-ItemProperty -Path $key -Name InstallId).InstallId;" ^
-  "$os=(Get-CimInstance Win32_OperatingSystem).Caption;" ^
-  "$body=@{installId=$id;version='%SCRIPT_VERSION%';os=$os}|ConvertTo-Json;" ^
-  "Invoke-RestMethod -Uri '%TELEMETRY_URL%' -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 5;" ^
-  "Set-ItemProperty -Path $key -Name InstallReported -Value 1 -Type DWord" >nul 2>&1
+if not exist "C:\IEMode\telemetry_pending.json" call :TELEMETRY_SAVE_PENDING
 
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='Stop';" ^
+  "$pendingPath='%TELEMETRY_PENDING%';" ^
+  "$url='%TELEMETRY_URL%';" ^
+  "$key='HKCU:\Software\GUMS\EditIE';" ^
+  "if (-not (Test-Path $pendingPath)) { exit 1 };" ^
+  "$report = Get-Content $pendingPath -Raw | ConvertFrom-Json;" ^
+  "$body = $report | ConvertTo-Json -Compress;" ^
+  "Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 10 | Out-Null;" ^
+  "Set-ItemProperty -Path $key -Name InstallReported -Value 1 -Type DWord;" ^
+  "Remove-Item $pendingPath -Force" >nul 2>&1
+
+exit /b
+
+:TELEMETRY_SAVE_PENDING
+mkdir C:\IEMode 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$key='HKCU:\Software\GUMS\EditIE';" ^
+  "$pendingPath='%TELEMETRY_PENDING%';" ^
+  "$id=(Get-ItemProperty -Path $key -Name InstallId -ErrorAction SilentlyContinue).InstallId;" ^
+  "if (-not $id) { $id=[guid]::NewGuid().ToString(); Set-ItemProperty -Path $key -Name InstallId -Value $id };" ^
+  "$report=[ordered]@{installId=$id;computerName=$env:COMPUTERNAME;windowsVersion=(Get-CimInstance Win32_OperatingSystem).Caption;version='%SCRIPT_VERSION%';installedAt=(Get-Date).ToUniversalTime().ToString('o')};" ^
+  "$report | ConvertTo-Json | Set-Content -Path $pendingPath -Encoding UTF8" >nul 2>&1
 exit /b

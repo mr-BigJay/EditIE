@@ -281,7 +281,9 @@ echo.
 echo   To help the IT department track how many systems
 echo   have installed this tool, you may allow sending a
 echo   one-time report to the internal server when online.
-echo.
+echo   If the server is not reachable (e.g. without VPN), the
+echo   report stays on this PC and is sent automatically when
+echo   internet/VPN becomes available (every 30 min or at logon).
 echo   Data sent: computer name, Windows version, software version
 echo   Sender IP is recorded automatically by the server.
 echo.
@@ -297,6 +299,7 @@ if "%telemetry_choice%"=="1" (
     reg add "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn /t REG_DWORD /d 1 /f >nul
     reg add "HKCU\Software\GUMS\EditIE" /v InstallId /t REG_SZ /d "%INSTALL_ID%" /f >nul
     call :TELEMETRY_SAVE_PENDING
+    call :TELEMETRY_REGISTER_TASK
 ) else (
     reg add "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn /t REG_DWORD /d 0 /f >nul
 )
@@ -306,22 +309,58 @@ reg query "HKCU\Software\GUMS\EditIE" /v TelemetryOptIn | find "0x1" >nul
 if %ERRORLEVEL% NEQ 0 exit /b
 
 reg query "HKCU\Software\GUMS\EditIE" /v InstallReported >nul 2>&1
-if %ERRORLEVEL% EQU 0 exit /b
+if %ERRORLEVEL% EQU 0 (
+    schtasks /Delete /TN "GUMS-EditIE-Telemetry" /F >nul 2>&1
+    exit /b
+)
 
 if not exist "C:\IEMode\telemetry_pending.json" call :TELEMETRY_SAVE_PENDING
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='Stop';" ^
-  "$pendingPath='%TELEMETRY_PENDING%';" ^
-  "$url='%TELEMETRY_URL%';" ^
-  "$key='HKCU:\Software\GUMS\EditIE';" ^
-  "if (-not (Test-Path $pendingPath)) { exit 1 };" ^
-  "$report = Get-Content $pendingPath -Raw | ConvertFrom-Json;" ^
-  "$body = $report | ConvertTo-Json -Compress;" ^
-  "Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 10 | Out-Null;" ^
-  "Set-ItemProperty -Path $key -Name InstallReported -Value 1 -Type DWord;" ^
-  "Remove-Item $pendingPath -Force" >nul 2>&1
+call :TELEMETRY_REGISTER_TASK
+call :TELEMETRY_TRY_SEND
 
+exit /b
+
+:TELEMETRY_TRY_SEND
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\IEMode\send-telemetry.ps1" >nul 2>&1
+exit /b
+
+:TELEMETRY_REGISTER_TASK
+mkdir C:\IEMode 2>nul
+call :TELEMETRY_WRITE_SCRIPT
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$scriptPath='C:\IEMode\send-telemetry.ps1';" ^
+  "$action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $scriptPath\";" ^
+  "$triggers=@((New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration ([TimeSpan]::MaxValue)), (New-ScheduledTaskTrigger -AtLogOn));" ^
+  "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2);" ^
+  "Register-ScheduledTask -TaskName 'GUMS-EditIE-Telemetry' -Action $action -Trigger $triggers -Settings $settings -Force | Out-Null" >nul 2>&1
+exit /b
+
+:TELEMETRY_WRITE_SCRIPT
+(
+echo $key = 'HKCU:\Software\GUMS\EditIE'
+echo $pendingPath = 'C:\IEMode\telemetry_pending.json'
+echo $url = '%TELEMETRY_URL%'
+echo $taskName = 'GUMS-EditIE-Telemetry'
+echo.
+echo if ^((Get-ItemProperty -Path $key -Name InstallReported -ErrorAction SilentlyContinue^).InstallReported -eq 1^) {
+echo     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+echo     exit 0
+echo }
+echo.
+echo if ^(-not ^(Test-Path $pendingPath^)^) { exit 0 }
+echo.
+echo try {
+echo     $report = Get-Content $pendingPath -Raw ^| ConvertFrom-Json
+echo     $body = $report ^| ConvertTo-Json -Compress
+echo     Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 10 ^| Out-Null
+echo     Set-ItemProperty -Path $key -Name InstallReported -Value 1 -Type DWord
+echo     Remove-Item $pendingPath -Force
+echo     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+echo } catch {
+echo     exit 1
+echo }
+) > "C:\IEMode\send-telemetry.ps1"
 exit /b
 
 :TELEMETRY_SAVE_PENDING

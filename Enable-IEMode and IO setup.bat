@@ -1,28 +1,56 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 set "SCRIPT_DIR=%~dp0"
 set "PS=powershell.exe -NoProfile -ExecutionPolicy Bypass"
+set "EDITIE_RUNID="
 
 :: ==========================================================
 :: Capture launcher context, then elevate (Administrator)
 :: ==========================================================
 NET SESSION >nul 2>&1
 IF %ERRORLEVEL% NEQ 0 (
-    %PS% -File "%SCRIPT_DIR%scripts\Save-LaunchContext.ps1"
-    %PS% -Command "Start-Process -FilePath '%~f0' -Verb RunAs -ArgumentList '/elevated'"
+    set "EDITIE_CTX_OUT=%TEMP%\EditIE-runid.txt"
+    set "EDITIE_CTX_ERR=%TEMP%\EditIE-runid.err"
+    del "%EDITIE_CTX_OUT%" 2>nul
+    del "%EDITIE_CTX_ERR%" 2>nul
+    %PS% -File "%SCRIPT_DIR%scripts\Save-LaunchContext.ps1" 1>"%EDITIE_CTX_OUT%" 2>"%EDITIE_CTX_ERR%"
+    if errorlevel 1 (
+        echo Failed to save launch context. Elevation aborted.
+        type "%EDITIE_CTX_ERR%" 2>nul
+        pause
+        EXIT /B 1
+    )
+    set /p EDITIE_RUNID=<"%EDITIE_CTX_OUT%"
+    if not defined EDITIE_RUNID (
+        echo Launch context file was empty. Elevation aborted.
+        pause
+        EXIT /B 1
+    )
+    %PS% -Command "Start-Process -FilePath '%~f0' -Verb RunAs -ArgumentList '/elevated','!EDITIE_RUNID!'"
     EXIT /B
 )
 
-IF /I NOT "%~1"=="/elevated" (
-    %PS% -File "%SCRIPT_DIR%scripts\Save-LaunchContext.ps1"
+IF /I "%~1"=="/elevated" (
+    set "EDITIE_RUNID=%~2"
+    if not defined EDITIE_RUNID (
+        echo Missing run id for elevated session. Start the batch file without an elevated prompt.
+        pause
+        EXIT /B 1
+    )
+    goto MAIN
 )
 
+echo Run this tool from a non-elevated session so the launcher user can be captured.
+echo Or use: "%~f0" /elevated {run-id}
+pause
+EXIT /B 1
+
+:MAIN
 title Automation Office Configuration - GUMS
 color 0A
 
 :MENU
 cls
-
 echo ==========================================================
 echo.
 echo      Guilan University of Medical Sciences
@@ -56,70 +84,34 @@ if /I "%choice%"=="0" exit /B 0
 
 goto MENU
 
-:: ==========================================================
-:: EDGE SETTINGS
-:: ==========================================================
-
 :EDGE
 cls
-echo ==========================================================
-echo.
 echo Applying Microsoft Edge Settings...
-echo.
-echo ==========================================================
-echo.
-%PS% -File "%SCRIPT_DIR%scripts\Invoke-EdgeSettings.ps1"
+%PS% -File "%SCRIPT_DIR%scripts\Invoke-EdgeSettings.ps1" -RunId "%EDITIE_RUNID%"
 echo.
 pause
 goto MENU
-
-:: ==========================================================
-:: INTERNET OPTIONS (MODERN)
-:: ==========================================================
 
 :INTERNET_MODERN
 cls
-echo ==========================================================
-echo.
 echo Applying Internet Options Settings (Modern TLS)...
-echo.
-echo ==========================================================
-echo.
-%PS% -File "%SCRIPT_DIR%scripts\Invoke-InternetSettings.ps1" -TlsMode Modern
+%PS% -File "%SCRIPT_DIR%scripts\Invoke-InternetSettings.ps1" -TlsMode Modern -RunId "%EDITIE_RUNID%"
 echo.
 pause
 goto MENU
-
-:: ==========================================================
-:: INTERNET OPTIONS (LEGACY)
-:: ==========================================================
 
 :INTERNET_LEGACY
 cls
-echo ==========================================================
-echo.
 echo LEGACY TLS MODE - SSL 3.0 / TLS 1.0 / 1.1 (insecure)
-echo.
-echo ==========================================================
-echo.
-%PS% -File "%SCRIPT_DIR%scripts\Invoke-InternetSettings.ps1" -TlsMode Legacy
+%PS% -File "%SCRIPT_DIR%scripts\Invoke-InternetSettings.ps1" -TlsMode Legacy -RunId "%EDITIE_RUNID%"
 echo.
 pause
 goto MENU
 
-:: ==========================================================
-:: RESTORE FROM BACKUP
-:: ==========================================================
-
 :RESET
 cls
-echo ==========================================================
-echo.
 echo Restoring settings from backup...
-echo.
-echo ==========================================================
-echo.
-%PS% -File "%SCRIPT_DIR%scripts\Invoke-RestoreSettings.ps1"
+%PS% -File "%SCRIPT_DIR%scripts\Invoke-RestoreSettings.ps1" -RunId "%EDITIE_RUNID%"
 echo.
 pause
 goto MENU

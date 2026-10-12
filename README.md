@@ -50,17 +50,19 @@ Not run in CI (Linux agents have no Windows registry). On each scenario:
 | 2 | One or more required operations failed |
 | 3 | Partial success — GPO blocks `SecureProtocols` |
 
-## Non-Windows syntax check
+## Automated tests (logic only — no Windows registry)
 
 ```bash
-pwsh -Command "
-  \$e = \$null
-  [void][System.Management.Automation.Language.Parser]::ParseFile('scripts/EditIE-Core.ps1', [ref]\$null, [ref]\$e)
-  if (\$e) { \$e; exit 1 }
-"
+python3 tests/test_editie_logic.py
 ```
 
-On Linux, install PowerShell (`pwsh`) if needed; this only validates parse errors, not runtime behavior.
+On Windows, also run:
+
+```powershell
+powershell -NoProfile -File tests\Run-EditIELogicTests.ps1
+```
+
+These cover TLS 1.3 assessment, launch-context TTL, exit-code rules, and policy path helpers. **Registry I/O, GPO, Advanced UI, and multi-user restore require manual Windows verification** (see scenario matrix above).
 
 ## Security notes
 

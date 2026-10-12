@@ -1,4 +1,6 @@
 #Requires -Version 5.1
+param([string]$RunId)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'EditIE-Core.ps1')
 
@@ -6,34 +8,34 @@ Initialize-EditIELogging -OperationName 'Restore'
 $results = New-Object System.Collections.Generic.List[object]
 
 try {
-    $userCtx = Get-TargetUserContext
-    Write-EditIELog "Target user: $($userCtx.UserName) ($($userCtx.UserSid))" 'INFO'
-
+    $userCtx = Get-TargetUserContext -RunId $RunId
     $mount = Get-UserRegistryMount -UserSid $userCtx.UserSid
-    $restored = Restore-SettingsFromBackup -UserSid $userCtx.UserSid -UserHivePrefix $mount.HivePrefix
-    foreach ($r in $restored) { $results.Add($r) | Out-Null }
+
+    foreach ($r in (Restore-UserSettingsFromBackup -UserSid $userCtx.UserSid -UserHivePrefix $mount.HivePrefix)) {
+        $results.Add($r) | Out-Null
+    }
+    foreach ($r in (Restore-MachineSettingsFromBackup -RequestingUserSid $userCtx.UserSid -UserHivePrefix $mount.HivePrefix)) {
+        $results.Add($r) | Out-Null
+    }
 
     $failed = @($results | Where-Object { $_.Status -eq 'Failed' })
+    $skipped = @($results | Where-Object { $_.Status -eq 'Skipped' })
+
     Show-EditIESummary -Results $results -Notes @(
-        'Settings were restored from the backup captured before the first configuration change.'
-        'Restart Microsoft Edge and reopen Internet Options to verify.'
-        'Reboot if Schannel values were previously changed in Legacy mode.'
+        "Restore failures: $($failed.Count); skipped: $($skipped.Count)."
+        'User HKU settings always restored; HKLM only when machine backup owner SID matches.'
+        'Reopen inetcpl.cpl and restart Edge to verify.'
     )
 
     if ($failed.Count -gt 0) {
-        Write-Host ''
-        Write-Host 'Restore completed with errors. See log.'
+        Write-Host 'Restore completed with errors (partial restore).'
         exit 2
     }
-
-    Write-Host ''
-    Write-Host 'Settings restored from backup successfully.'
+    Write-Host 'Restore completed.'
     exit 0
 }
 catch {
     Write-EditIELog $_.Exception.Message 'ERROR'
-    Write-Host ''
     Write-Host "Error: $($_.Exception.Message)"
-    if ($script:LogFilePath) { Write-Host "Log: $script:LogFilePath" }
     exit 1
 }

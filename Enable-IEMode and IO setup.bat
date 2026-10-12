@@ -46,6 +46,13 @@ pause
 EXIT /B 1
 
 :MAIN
+%PS% -File "%SCRIPT_DIR%scripts\Register-EditIEMenuSession.ps1" -RunId "%EDITIE_RUNID%"
+if errorlevel 1 (
+    echo Failed to register menu session.
+    pause
+    EXIT /B 1
+)
+
 title Automation Office Configuration - GUMS
 color 0A
 

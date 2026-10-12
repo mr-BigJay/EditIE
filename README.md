@@ -49,6 +49,7 @@ Not run in CI (Linux agents have no Windows registry). On each scenario:
 | 1 | Fatal error (user hive, I/O, etc.) |
 | 2 | One or more required operations failed |
 | 3 | Partial success — GPO blocks `SecureProtocols` |
+| 4 | Partial restore — user HKU restored; HKLM/sites skipped (owner mismatch or no machine backup) |
 
 ## Automated tests (logic only — no Windows registry)
 

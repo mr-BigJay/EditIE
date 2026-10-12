@@ -16,6 +16,7 @@ $script:EditIEDataRoot = 'C:\IEMode'
 $script:EditIELogDir = Join-Path $script:EditIEDataRoot 'logs'
 $script:EditIEBackupDir = Join-Path $script:EditIEDataRoot 'backup'
 $script:EditIEContextDir = Join-Path $env:ProgramData 'GUMS-EditIE\contexts'
+$script:EditIESessionDir = Join-Path $env:ProgramData 'GUMS-EditIE\sessions'
 $script:EditIESitesXml = Join-Path $script:EditIEDataRoot 'sites.xml'
 $script:EditIEMachineBackup = Join-Path $script:EditIEBackupDir 'backup_machine.json'
 
@@ -76,6 +77,9 @@ function Invoke-RegQueryValue {
     if ($r.ExitCode -eq 0) {
         $line = $r.Lines | Where-Object { $_ -match 'REG_' } | Select-Object -First 1
         if (-not $line) {
+            if ($r.Output -match '(?i)unable to find|cannot find|not find') {
+                return [pscustomobject]@{ Status = 'NotFound'; Value = $null; Message = $r.Output }
+            }
             return [pscustomobject]@{ Status = 'Error'; Value = $null; Message = 'Unexpected reg query output' }
         }
         if ($line -match 'REG_DWORD\s+0x([0-9a-fA-F]+)') {
@@ -92,10 +96,13 @@ function Invoke-RegQueryValue {
     if ($r.Output -match '(?i)access is denied|access denied') {
         return [pscustomobject]@{ Status = 'AccessDenied'; Value = $null; Message = $r.Output }
     }
-    if ($r.Output -match '(?i)error.*(cannot find|unable to find|not found)') {
+    if ($r.Output -match '(?i)unable to find|cannot find|not find|error.*not found') {
         return [pscustomobject]@{ Status = 'NotFound'; Value = $null; Message = $r.Output }
     }
-    return [pscustomobject]@{ Status = 'Error'; Value = $null; Message = $r.Output }
+    if ($r.ExitCode -ne 0 -and $r.Output -match '(?i)invalid syntax|incorrect function') {
+        return [pscustomobject]@{ Status = 'Error'; Value = $null; Message = $r.Output }
+    }
+    return [pscustomobject]@{ Status = 'Error'; Value = $null; Message = if ($r.Output) { $r.Output } else { "reg query exit code $($r.ExitCode)" } }
 }
 
 function Invoke-RegTestKey {
@@ -109,7 +116,10 @@ function Invoke-RegTestKey {
     if ($r.Output -match '(?i)access is denied|access denied') {
         return [pscustomobject]@{ Status = 'AccessDenied'; Message = $r.Output }
     }
-    return [pscustomobject]@{ Status = 'NotFound'; Message = $r.Output }
+    if ($r.Output -match '(?i)unable to find|cannot find|not find') {
+        return [pscustomobject]@{ Status = 'NotFound'; Message = $r.Output }
+    }
+    return [pscustomobject]@{ Status = 'Error'; Message = if ($r.Output) { $r.Output } else { "reg query exit code $($r.ExitCode)" } }
 }
 
 function Get-RegistryValue {
@@ -128,56 +138,36 @@ function Get-InteractiveUserContext {
     param([switch]$AllowUnresolved)
 
     $current = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $isSystem = $current.IsSystem
-    if ($isSystem -and -not $AllowUnresolved) {
+    if ($current.IsSystem -and -not $AllowUnresolved) {
         throw 'Running as SYSTEM without a validated launch context. Run from the target user session (fail-safe).'
     }
 
-    $userName = $null
-    $sessionId = $null
-    try {
-        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
-        if ($cs.UserName) { $userName = $cs.UserName }
-    }
-    catch { }
-
-    if (-not $userName) {
-        try {
-            $q = query user 2>$null | Select-Object -Skip 1
-            foreach ($row in $q) {
-                if ($row -match '^\s*>?\s*(\S+)\s+(\d+)\s+') {
-                    $userName = $matches[1]
-                    $sessionId = [int]$matches[2]
-                    break
-                }
-            }
-        }
-        catch { }
-    }
-
-    if (-not $userName -and -not $isSystem) { $userName = $current.Name }
-
-    $sid = $null
-    if ($userName) {
-        try {
-            if ($userName -notmatch '\\') { $userName = "$env:USERDOMAIN\$userName" }
-            $nt = New-Object System.Security.Principal.NTAccount($userName)
-            $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier]).Value
-        }
-        catch { }
-    }
-    if (-not $sid -and -not $isSystem) {
-        $sid = $current.User.Value
-        if (-not $userName) { $userName = $current.Name }
-    }
-
+    $sid = $current.User.Value
     if (-not $sid -and $AllowUnresolved) {
-        return [pscustomobject]@{ UserName = $userName; UserSid = $null; SessionId = $sessionId; IsSystem = $isSystem; Resolved = $false }
+        return [pscustomobject]@{
+            UserName = $current.Name; UserSid = $null; IsSystem = $current.IsSystem; Resolved = $false
+        }
     }
     if (-not $sid) {
-        throw 'Could not resolve the interactive user. Run from the target user session.'
+        throw 'Could not resolve the launching user SID from WindowsIdentity.GetCurrent().'
     }
-    return [pscustomobject]@{ UserName = $userName; UserSid = $sid; SessionId = $sessionId; IsSystem = $isSystem; Resolved = $true }
+
+    return [pscustomobject]@{
+        UserName  = $current.Name
+        UserSid   = $sid
+        IsSystem  = $current.IsSystem
+        Resolved  = $true
+    }
+}
+
+function Assert-LauncherTargetIdentity {
+    param(
+        [string]$LauncherSid,
+        [string]$TargetUserSid
+    )
+    if (-not (Test-LauncherTargetSidMatch -LauncherSid $LauncherSid -TargetUserSid $TargetUserSid)) {
+        throw "Launcher SID ($LauncherSid) differs from target user SID ($TargetUserSid). Refusing to change another user's settings (RDP/multi-user safety)."
+    }
 }
 
 function Set-ContextFileAcl {
@@ -199,7 +189,7 @@ function Set-ContextFileAcl {
         Set-Acl -Path $FilePath -AclObject $acl
     }
     catch {
-        Write-Verbose "ACL hardening skipped: $($_.Exception.Message)"
+        throw "Failed to set launch context ACL on ${FilePath}: $($_.Exception.Message)"
     }
 }
 
@@ -213,19 +203,20 @@ function Save-LaunchContext {
         throw 'Cannot save launch context as SYSTEM without an interactive launcher.'
     }
 
-    $ctx = Get-InteractiveUserContext -AllowUnresolved:$false
+    $launcherSid = $launcher.User.Value
+    if (-not $launcherSid) { throw 'Launching process has no user SID.' }
+
     $runId = [guid]::NewGuid().ToString('D')
     $now = Get-Date
     $payload = @{
-        runId           = $runId
-        capturedAt      = $now.ToString('o')
-        expiresAt       = $now.AddMinutes((Get-EditIEContextMaxAgeMinutes)).ToString('o')
-        userName        = $ctx.UserName
-        userSid         = $ctx.UserSid
-        sessionId       = $ctx.SessionId
-        launcherSid     = $launcher.User.Value
-        launcherName    = $launcher.Name
-        launcherPid     = $PID
+        runId                = $runId
+        capturedAt           = $now.ToString('o')
+        elevationExpiresAt   = $now.AddMinutes((Get-EditIEContextElevationMaxAgeMinutes)).ToString('o')
+        userName             = $launcher.Name
+        userSid              = $launcherSid
+        launcherSid          = $launcherSid
+        launcherName         = $launcher.Name
+        launcherPid          = $PID
     }
 
     $path = Join-Path $script:EditIEContextDir "$runId.json"
@@ -238,13 +229,44 @@ function Save-LaunchContext {
     return $runId
 }
 
+function Register-EditIEMenuSession {
+    param([Parameter(Mandatory)][string]$RunId)
+
+    if (-not (Test-Path $script:EditIESessionDir)) {
+        New-Item -ItemType Directory -Path $script:EditIESessionDir -Force | Out-Null
+    }
+    $validUntil = (Get-Date).AddHours((Get-EditIESessionMaxAgeHours))
+    $payload = @{
+        runId      = $RunId
+        startedAt  = (Get-Date).ToString('o')
+        validUntil = $validUntil.ToString('o')
+    }
+    $sessionPath = Join-Path $script:EditIESessionDir "$RunId.session.json"
+    $payload | ConvertTo-Json | Set-Content -Path $sessionPath -Encoding UTF8 -Force
+}
+
+function Test-EditIEMenuSessionValid {
+    param([Parameter(Mandatory)][string]$RunId)
+
+    $sessionPath = Join-Path $script:EditIESessionDir "$RunId.session.json"
+    if (-not (Test-Path $sessionPath)) { return $false }
+    try {
+        $s = Get-Content $sessionPath -Raw | ConvertFrom-Json
+        $until = [datetime]::Parse([string]$s.validUntil, $null, [Globalization.DateTimeStyles]::RoundtripKind)
+        return (Test-EditIEMenuSessionFreshness -ValidUntil $until -Now (Get-Date))
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-ValidatedLaunchContext {
     param([Parameter(Mandatory)][string]$RunId)
 
     if ([string]::IsNullOrWhiteSpace($RunId)) { throw 'Missing run id for elevated session.' }
 
     $path = Join-Path $script:EditIEContextDir "$RunId.json"
-    if (-not (Test-Path $path)) { throw "Launch context not found or expired (missing file for run $RunId)." }
+    if (-not (Test-Path $path)) { throw "Launch context not found (missing file for run $RunId)." }
 
     try {
         $saved = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -257,13 +279,14 @@ function Get-ValidatedLaunchContext {
         throw 'Launch context run id mismatch.'
     }
 
-    $captured = [datetime]::Parse([string]$saved.capturedAt, $null, [Globalization.DateTimeStyles]::RoundtripKind)
-    if (-not (Test-LaunchContextFreshness -CapturedAt $captured -Now (Get-Date))) {
-        throw 'Launch context expired. Run the batch file again without reusing an old elevation.'
-    }
+    Assert-LauncherTargetIdentity -LauncherSid ([string]$saved.launcherSid) -TargetUserSid ([string]$saved.userSid)
 
-    if ([string]$saved.userSid -ne [string]$saved.launcherSid) {
-        Write-EditIELog "Launch context: launcher SID differs from target user SID (launcher=$($saved.launcherSid) target=$($saved.userSid))" 'WARN'
+    $menuSessionOk = Test-EditIEMenuSessionValid -RunId $RunId
+    if (-not $menuSessionOk) {
+        $captured = [datetime]::Parse([string]$saved.capturedAt, $null, [Globalization.DateTimeStyles]::RoundtripKind)
+        if (-not (Test-LaunchContextElevationFreshness -CapturedAt $captured -Now (Get-Date))) {
+            throw 'Launch context elevation window expired and no active menu session. Close and restart the batch file.'
+        }
     }
 
     return [pscustomobject]@{
@@ -525,12 +548,19 @@ function Get-UserBackupPath { param([string]$UserSid) Join-Path $script:EditIEBa
 function Export-RegistrySnapshotEntry {
     param([string]$HivePrefix, [string]$SubKey, [string]$Name, [string]$Type = 'REG_DWORD')
     $tk = Invoke-RegTestKey -HivePrefix $HivePrefix -SubKey $SubKey
+    if ($tk.Status -eq 'AccessDenied') {
+        throw "Access denied opening registry key $HivePrefix\$SubKey"
+    }
+    if ($tk.Status -eq 'Error') {
+        throw "Registry error opening key $HivePrefix\$SubKey`: $($tk.Message)"
+    }
     $keyExists = ($tk.Status -eq 'Found')
     $hadValue = $false; $value = $null
     if ($keyExists) {
         $q = Invoke-RegQueryValue -HivePrefix $HivePrefix -SubKey $SubKey -Name $Name
         if ($q.Status -eq 'Found') { $hadValue = $true; $value = $q.Value }
         elseif ($q.Status -eq 'AccessDenied') { throw "Access denied reading $SubKey\$Name" }
+        elseif ($q.Status -eq 'Error') { throw "Registry error reading $SubKey\$Name`: $($q.Message)" }
     }
     return [pscustomobject]@{
         hivePrefix = $HivePrefix; subKey = $SubKey; name = $Name; type = $Type
@@ -538,13 +568,22 @@ function Export-RegistrySnapshotEntry {
     }
 }
 
-function Backup-SitesXml {
-    $backupFile = Join-Path $script:EditIEBackupDir 'sites.xml.bak'
-    if (Test-Path $script:EditIESitesXml) {
-        Copy-Item -Path $script:EditIESitesXml -Destination $backupFile -Force
-        return $true
+function Get-SitesXmlBackupPath { Join-Path $script:EditIEBackupDir 'sites.xml.bak' }
+
+function Backup-SitesXmlIfMissing {
+    $backupFile = Get-SitesXmlBackupPath
+    if (Test-SitesXmlBackupImmutable -BackupAlreadyExists (Test-Path $backupFile)) {
+        return [pscustomobject]@{ BackedUp = (Test-Path $backupFile); ExistedAtBackup = $null; SkippedOverwrite = $true }
     }
-    return $false
+    $existed = Test-Path $script:EditIESitesXml
+    if ($existed) {
+        Copy-Item -Path $script:EditIESitesXml -Destination $backupFile -Force
+    }
+    return [pscustomobject]@{
+        BackedUp          = $existed
+        ExistedAtBackup   = $existed
+        SkippedOverwrite  = $false
+    }
 }
 
 function Initialize-UserSettingsBackup {
@@ -586,15 +625,30 @@ function Initialize-UserSettingsBackup {
     Write-EditIELog "User backup: $backupPath" 'OK'
 }
 
+function Test-MachineBackupFileValid {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $j = Get-Content $Path -Raw | ConvertFrom-Json
+        return ($null -ne $j.version -and $null -ne $j.entries)
+    }
+    catch { return $false }
+}
+
 function Initialize-MachineSettingsBackup {
     param([string]$OwnerUserSid)
 
     if (-not (Test-Path $script:EditIEBackupDir)) { New-Item -ItemType Directory -Path $script:EditIEBackupDir -Force | Out-Null }
 
+    if (Test-MachineBackupShouldSkipCreate -BackupFileExists (Test-Path $script:EditIEMachineBackup) -BackupValid (Test-MachineBackupFileValid -Path $script:EditIEMachineBackup)) {
+        Write-EditIELog "Machine backup already exists — not overwriting ($script:EditIEMachineBackup)" 'INFO'
+        return $false
+    }
+
     if (Test-Path $script:EditIEMachineBackup) {
         $existing = Get-Content $script:EditIEMachineBackup -Raw | ConvertFrom-Json
         if ($existing.ownerUserSid -and [string]$existing.ownerUserSid -ne $OwnerUserSid) {
-            Write-EditIELog "Machine backup owned by $($existing.ownerUserSid); skipping HKLM snapshot for $OwnerUserSid" 'WARN'
+            Write-EditIELog "Machine backup owned by $($existing.ownerUserSid); skipping new HKLM snapshot for $OwnerUserSid" 'WARN'
             return $false
         }
     }
@@ -619,10 +673,11 @@ function Initialize-MachineSettingsBackup {
         }
     }
 
-    $sitesBacked = Backup-SitesXml
+    $sitesInfo = Backup-SitesXmlIfMissing
     $payload = @{
-        version = 3; scope = 'Machine'; createdAt = (Get-Date).ToString('o'); ownerUserSid = $OwnerUserSid
-        sitesXmlBackedUp = $sitesBacked
+        version = 4; scope = 'Machine'; createdAt = (Get-Date).ToString('o'); ownerUserSid = $OwnerUserSid
+        sitesXmlBackedUp = [bool]$sitesInfo.BackedUp
+        sitesXmlExistedAtBackup = [bool]$sitesInfo.ExistedAtBackup
         entries = @($entries | ForEach-Object { @{ hivePrefix = $_.hivePrefix; subKey = $_.subKey; name = $_.name; type = $_.type; value = $_.value; existed = $_.existed; keyExisted = $_.keyExisted; scope = $_.scope } })
     }
     $payload | ConvertTo-Json -Depth 6 | Set-Content -Path $script:EditIEMachineBackup -Encoding UTF8
@@ -656,7 +711,10 @@ function Restore-BackupEntries {
 
         if (-not [bool]$entry.existed) {
             $q = Invoke-RegQueryValue -HivePrefix $hive -SubKey $sub -Name $name
-            if ($q.Status -eq 'Found') {
+            if ($q.Status -eq 'AccessDenied' -or $q.Status -eq 'Error') {
+                $results.Add((New-EditIEResult -Label "$ScopeLabel $sub\$name" -Status 'Failed' -Detail $q.Message -Required $true -Category 'Restore')) | Out-Null
+            }
+            elseif ($q.Status -eq 'Found') {
                 $results.Add((Invoke-EditIERegistry -Operation Delete -HivePrefix $hive -SubKey $sub -Name $name -SettingLabel "$ScopeLabel delete $sub\$name" -Required $true -Category 'Restore')) | Out-Null
             }
             else {
@@ -680,26 +738,56 @@ function Restore-UserSettingsFromBackup {
 }
 
 function Restore-MachineSettingsFromBackup {
-    param([string]$RequestingUserSid, [string]$UserHivePrefix)
+    param(
+        [string]$RequestingUserSid,
+        [string]$UserHivePrefix,
+        [ref]$PartialRestore
+    )
+
+    $list = New-Object System.Collections.Generic.List[object]
 
     if (-not (Test-Path $script:EditIEMachineBackup)) {
         Write-EditIELog 'No machine backup — HKLM restore skipped' 'SKIP'
-        return @((New-EditIEResult -Label 'Machine HKLM restore' -Status 'Skipped' -Detail 'No machine backup file'))
+        $PartialRestore.Value = $true
+        $list.Add((New-EditIEResult -Label 'Machine HKLM restore' -Status 'Skipped' -Detail 'No machine backup file' -Required $false)) | Out-Null
+        return $list
     }
 
     $backup = Get-Content $script:EditIEMachineBackup -Raw | ConvertFrom-Json
     if ($backup.ownerUserSid -and [string]$backup.ownerUserSid -ne $RequestingUserSid) {
         Write-EditIELog "Machine backup owned by $($backup.ownerUserSid); not restoring HKLM for $RequestingUserSid" 'WARN'
-        return @((New-EditIEResult -Label 'Machine HKLM restore' -Status 'Skipped' -Detail 'Machine backup belongs to another user SID'))
+        $PartialRestore.Value = $true
+        $list.Add((New-EditIEResult -Label 'Machine HKLM restore' -Status 'Skipped' -Detail 'Machine backup belongs to another user SID' -Required $false)) | Out-Null
+        return $list
     }
 
-    $results = Restore-BackupEntries -Entries $backup.entries -UserHivePrefix $UserHivePrefix -ScopeLabel 'Machine'
-    $bakSites = Join-Path $script:EditIEBackupDir 'sites.xml.bak'
-    if ([bool]$backup.sitesXmlBackedUp -and (Test-Path $bakSites)) {
-        Copy-Item -Path $bakSites -Destination $script:EditIESitesXml -Force
-        $results.Add((New-EditIEResult -Label 'Restore sites.xml' -Status 'Success' -Required $true -Category 'Restore')) | Out-Null
+    foreach ($r in (Restore-BackupEntries -Entries @($backup.entries) -UserHivePrefix $UserHivePrefix -ScopeLabel 'Machine')) {
+        $list.Add($r) | Out-Null
     }
-    return $results
+
+    $bakSites = Get-SitesXmlBackupPath
+    $existedAtBackup = $false
+    if ($null -ne $backup.PSObject.Properties['sitesXmlExistedAtBackup']) {
+        $existedAtBackup = [bool]$backup.sitesXmlExistedAtBackup
+    }
+    elseif ([bool]$backup.sitesXmlBackedUp) {
+        $existedAtBackup = $true
+    }
+
+    if ($existedAtBackup -and (Test-Path $bakSites)) {
+        Copy-Item -Path $bakSites -Destination $script:EditIESitesXml -Force
+        $list.Add((New-EditIEResult -Label 'Restore sites.xml' -Status 'Success' -Required $true -Category 'Restore')) | Out-Null
+    }
+    elseif (-not $existedAtBackup) {
+        if (Test-Path $script:EditIESitesXml) {
+            Remove-Item -Path $script:EditIESitesXml -Force -ErrorAction Stop
+            $list.Add((New-EditIEResult -Label 'Remove sites.xml (not present before backup)' -Status 'Success' -Required $true -Category 'Restore')) | Out-Null
+        }
+        else {
+            $list.Add((New-EditIEResult -Label 'sites.xml' -Status 'Skipped' -Detail 'Already absent')) | Out-Null
+        }
+    }
+    return $list
 }
 
 function Show-EditIESummary {
@@ -719,9 +807,15 @@ function Initialize-SettingsBackup {
 }
 
 function Restore-SettingsFromBackup {
-    param([string]$UserSid, [string]$UserHivePrefix)
+    param(
+        [string]$UserSid,
+        [string]$UserHivePrefix,
+        [ref]$PartialRestore
+    )
     $all = New-Object System.Collections.Generic.List[object]
     foreach ($r in (Restore-UserSettingsFromBackup -UserSid $UserSid -UserHivePrefix $UserHivePrefix)) { $all.Add($r) | Out-Null }
-    foreach ($r in (Restore-MachineSettingsFromBackup -RequestingUserSid $UserSid -UserHivePrefix $UserHivePrefix)) { $all.Add($r) | Out-Null }
+    foreach ($r in (Restore-MachineSettingsFromBackup -RequestingUserSid $UserSid -UserHivePrefix $UserHivePrefix -PartialRestore $PartialRestore)) {
+        $all.Add($r) | Out-Null
+    }
     return $all
 }

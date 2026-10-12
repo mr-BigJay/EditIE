@@ -6,33 +6,31 @@ $ErrorActionPreference = 'Stop'
 
 Initialize-EditIELogging -OperationName 'Restore'
 $results = New-Object System.Collections.Generic.List[object]
+$partial = $false
 
 try {
     $userCtx = Get-TargetUserContext -RunId $RunId
     $mount = Get-UserRegistryMount -UserSid $userCtx.UserSid
 
-    foreach ($r in (Restore-UserSettingsFromBackup -UserSid $userCtx.UserSid -UserHivePrefix $mount.HivePrefix)) {
-        $results.Add($r) | Out-Null
-    }
-    foreach ($r in (Restore-MachineSettingsFromBackup -RequestingUserSid $userCtx.UserSid -UserHivePrefix $mount.HivePrefix)) {
+    $partialRef = [ref]$partial
+    foreach ($r in (Restore-SettingsFromBackup -UserSid $userCtx.UserSid -UserHivePrefix $mount.HivePrefix -PartialRestore $partialRef)) {
         $results.Add($r) | Out-Null
     }
 
     $failed = @($results | Where-Object { $_.Status -eq 'Failed' })
-    $skipped = @($results | Where-Object { $_.Status -eq 'Skipped' })
-
     Show-EditIESummary -Results $results -Notes @(
-        "Restore failures: $($failed.Count); skipped: $($skipped.Count)."
-        'User HKU settings always restored; HKLM only when machine backup owner SID matches.'
-        'Reopen inetcpl.cpl and restart Edge to verify.'
+        "Partial restore (HKLM skipped): $partial"
+        'User HKU settings restored from backup_user_<Sid>.json when available.'
     )
 
     if ($failed.Count -gt 0) {
-        Write-Host 'Restore completed with errors (partial restore).'
+        Write-Host 'Restore completed with errors.'
         exit 2
     }
-    Write-Host 'Restore completed.'
-    exit 0
+
+    $decision = Get-EditIEExitDecision -Results $results -PartialRestore:$partial
+    Write-Host $decision.Message
+    exit $decision.Code
 }
 catch {
     Write-EditIELog $_.Exception.Message 'ERROR'

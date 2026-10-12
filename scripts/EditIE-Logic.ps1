@@ -1,34 +1,37 @@
 #Requires -Version 5.1
-# Pure logic helpers (no registry I/O) — unit-testable on non-Windows hosts.
 Set-StrictMode -Version Latest
 
-$script:SecureProtocolBits = @{
-    Ssl3Client  = 0x00000020
-    Tls10Client = 0x00000080
-    Tls11Client = 0x00000200
-    Tls12Client = 0x00000800
-    Tls13Client = 0x00002000
-}
+function Get-EditIEContextElevationMaxAgeMinutes { return 15 }
+function Get-EditIESessionMaxAgeHours { return 8 }
 
-function Get-EditIEContextMaxAgeMinutes { return 15 }
-
-function Test-LaunchContextFreshness {
+function Test-LaunchContextElevationFreshness {
     param(
         [datetime]$CapturedAt,
         [datetime]$Now,
-        [int]$MaxAgeMinutes = (Get-EditIEContextMaxAgeMinutes)
+        [int]$MaxAgeMinutes = (Get-EditIEContextElevationMaxAgeMinutes)
     )
     $age = ($Now - $CapturedAt).TotalMinutes
     return ($age -ge 0 -and $age -le $MaxAgeMinutes)
 }
 
-function Test-LaunchContextRunId {
+function Test-EditIEMenuSessionFreshness {
     param(
-        [string]$ExpectedRunId,
-        [string]$ActualRunId
+        [datetime]$ValidUntil,
+        [datetime]$Now
     )
+    return ($ValidUntil -gt $Now)
+}
+
+function Test-LaunchContextRunId {
+    param([string]$ExpectedRunId, [string]$ActualRunId)
     if ([string]::IsNullOrWhiteSpace($ExpectedRunId)) { return $false }
     return ($ExpectedRunId -eq $ActualRunId)
+}
+
+function Test-LauncherTargetSidMatch {
+    param([string]$LauncherSid, [string]$TargetUserSid)
+    if ([string]::IsNullOrWhiteSpace($LauncherSid) -or [string]::IsNullOrWhiteSpace($TargetUserSid)) { return $false }
+    return ($LauncherSid -eq $TargetUserSid)
 }
 
 function Get-Tls13SupportAssessment {
@@ -42,12 +45,11 @@ function Get-Tls13SupportAssessment {
     )
 
     $reasons = New-Object System.Collections.Generic.List[string]
-    $status = 'Skipped'
 
     if ($OsBuild -lt 19041) {
         return [pscustomobject]@{
             Status  = 'Unsupported'
-            Reasons = @("OS build $OsBuild is below 19041 (TLS 1.3 not available on this Windows release).")
+            Reasons = @("OS build $OsBuild is below 19041 (TLS 1.3 not in supported Schannel set for this release).")
         }
     }
 
@@ -58,58 +60,61 @@ function Get-Tls13SupportAssessment {
         }
     }
 
-    $schannelDefaultOff = ($SchannelKeyExists -and $null -ne $SchannelDisabledByDefault -and $SchannelDisabledByDefault -eq 1 -and
-        ($null -eq $SchannelEnabled -or $SchannelEnabled -ne 1))
+    $schannelExplicitOn = ($SchannelKeyExists -and $null -ne $SchannelEnabled -and $SchannelEnabled -eq 1 -and
+        ($null -eq $SchannelDisabledByDefault -or $SchannelDisabledByDefault -eq 0))
 
-    if ($IsWindows11OrLater) {
+    if (-not $IsWindows11OrLater) {
+        # Windows client 10: TLS 1.3 is not treated as Supported for SecureProtocols automation
+        # (registry/UI presence alone is insufficient per Microsoft Schannel product defaults).
         if (-not $SchannelKeyExists) {
-            if ($CryptoUiTls13Present) {
-                $status = 'Supported'
-                $reasons.Add('Windows 11+: no explicit Schannel TLS 1.3 key, but Internet Options CRYPTO exposes TLS 1.3.') | Out-Null
-            }
-            else {
-                $status = 'Skipped'
-                $reasons.Add('Windows 11+: Schannel TLS 1.3 key absent and no TLS 1.3 Advanced option in CRYPTO — cannot confirm.') | Out-Null
+            return [pscustomobject]@{
+                Status  = 'Skipped'
+                Reasons = @('Windows 10: TLS 1.3 is not auto-enabled in SecureProtocols (no Schannel client key).')
             }
         }
-        elseif ($schannelDefaultOff) {
-            if ($CryptoUiTls13Present) {
-                $status = 'Skipped'
-                $reasons.Add('Windows 11: TLS 1.3 Schannel default-off without Enabled=1; UI present but runtime uncertain.') | Out-Null
-            }
-            else {
-                $status = 'Unsupported'
-                $reasons.Add('Windows 11: TLS 1.3 Schannel default-off and no CRYPTO UI entry.') | Out-Null
+        if ($schannelExplicitOn) {
+            return [pscustomobject]@{
+                Status  = 'Skipped'
+                Reasons = @('Windows 10: Schannel TLS 1.3 may be configured, but Windows 10 is not treated as Supported for automated Advanced alignment.')
             }
         }
-        else {
-            $status = 'Supported'
-            $reasons.Add('Windows 11: Schannel TLS 1.3 client configuration allows use.') | Out-Null
+        return [pscustomobject]@{
+            Status  = 'Skipped'
+            Reasons = @('Windows 10: TLS 1.3 Schannel not explicitly enabled (Enabled=1, DisabledByDefault=0).')
         }
     }
-    else {
-        # Windows 10 — presence of registry key alone is insufficient
-        if (-not $SchannelKeyExists) {
-            $status = 'Skipped'
-            $reasons.Add('Windows 10: no Schannel TLS 1.3 Client key — not treating as supported.') | Out-Null
+
+    # Windows 11+
+    if (-not $SchannelKeyExists) {
+        if ($CryptoUiTls13Present) {
+            return [pscustomobject]@{
+                Status  = 'Supported'
+                Reasons = @('Windows 11+: default Schannel TLS 1.3 stack; CRYPTO exposes TLS 1.3 in Advanced.')
+            }
         }
-        elseif ($schannelDefaultOff) {
-            $status = 'Skipped'
-            $reasons.Add('Windows 10: TLS 1.3 Schannel present but default-disabled without Enabled=1.') | Out-Null
+        return [pscustomobject]@{
+            Status  = 'Skipped'
+            Reasons = @('Windows 11+: no Schannel TLS 1.3 key and no CRYPTO TLS 1.3 option — cannot confirm.')
         }
-        elseif ($CryptoUiTls13Present) {
-            $status = 'Supported'
-            $reasons.Add('Windows 10: TLS 1.3 Schannel enabled and CRYPTO UI includes TLS 1.3.') | Out-Null
+    }
+
+    if ($schannelExplicitOn -or ($null -ne $SchannelDisabledByDefault -and $SchannelDisabledByDefault -eq 0)) {
+        return [pscustomobject]@{
+            Status  = 'Supported'
+            Reasons = @('Windows 11+: Schannel TLS 1.3 client available.')
         }
-        else {
-            $status = 'Skipped'
-            $reasons.Add('Windows 10: Schannel allows TLS 1.3 but CRYPTO UI entry missing — uncertain Advanced alignment.') | Out-Null
+    }
+
+    if ($CryptoUiTls13Present) {
+        return [pscustomobject]@{
+            Status  = 'Skipped'
+            Reasons = @('Windows 11: TLS 1.3 Schannel default-off; UI present but runtime not confirmed.')
         }
     }
 
     return [pscustomobject]@{
-        Status  = $status
-        Reasons = [string[]]$reasons
+        Status  = 'Unsupported'
+        Reasons = @('Windows 11: TLS 1.3 Schannel default-off and no CRYPTO UI entry.')
     }
 }
 
@@ -126,12 +131,17 @@ function Get-EditIEExitDecision {
     param(
         [object[]]$Results,
         [switch]$PolicyBlockedSecureProtocols,
-        [switch]$LegacyMode
+        [switch]$LegacyMode,
+        [switch]$PartialRestore
     )
 
     $failed = @($Results | Where-Object { $_.Status -eq 'Failed' })
     if ($failed.Count -gt 0) {
         return [pscustomobject]@{ Code = 2; Message = 'One or more required operations failed.' }
+    }
+
+    if ($PartialRestore) {
+        return [pscustomobject]@{ Code = 4; Message = 'Partial restore: user settings restored; machine-wide (HKLM) settings were not restored.' }
     }
 
     $required = @($Results | Where-Object { $_.Required -eq $true })
@@ -152,10 +162,7 @@ function Get-EditIEExitDecision {
 }
 
 function Test-SecureProtocolsMaskAlignment {
-    param(
-        [int]$ExpectedMask,
-        [int]$ActualMask
-    )
+    param([int]$ExpectedMask, [int]$ActualMask)
     return ($ExpectedMask -eq $ActualMask)
 }
 
@@ -166,4 +173,14 @@ function Get-CryptoUiTls13Present {
         if ($blob -match 'tls\s*1\.3|tls1\.3') { return $true }
     }
     return $false
+}
+
+function Test-MachineBackupShouldSkipCreate {
+    param([bool]$BackupFileExists, [bool]$BackupValid)
+    return ($BackupFileExists -and $BackupValid)
+}
+
+function Test-SitesXmlBackupImmutable {
+    param([bool]$BackupAlreadyExists)
+    return $BackupAlreadyExists
 }

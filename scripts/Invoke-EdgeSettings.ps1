@@ -13,7 +13,6 @@ try {
     Initialize-SettingsBackup -UserSid $userCtx.UserSid -UserHivePrefix $mount.HivePrefix | Out-Null
 
     if (-not (Test-Path $script:EditIEDataRoot)) { New-Item -ItemType Directory -Path $script:EditIEDataRoot -Force | Out-Null }
-    Backup-SitesXml | Out-Null
 
     @'
 <?xml version="1.0" encoding="utf-8"?>
